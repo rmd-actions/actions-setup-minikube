@@ -1,33 +1,194 @@
-describe('install module test suite', () => {
+'use strict';
+
+describe('install', () => {
   let core;
   let io;
-  let path;
   let exec;
+  let checkKubernetesVersion;
   let install;
+
   beforeEach(() => {
     jest.resetModules();
     jest.mock('@actions/core');
     jest.mock('@actions/io', () => ({
-      mkdirP: jest.fn(() => {}),
-      mv: jest.fn(() => {})
+      mkdirP: jest.fn(),
+      mv: jest.fn()
     }));
-    jest.mock('path');
     jest.mock('../exec');
+    jest.mock('../check-kubernetes-version', () => ({
+      checkKubernetesVersion: jest.fn().mockResolvedValue('supported'),
+      SUPPORTED: 'supported',
+      UNSUPPORTED: 'unsupported'
+    }));
     core = require('@actions/core');
     io = require('@actions/io');
-    path = require('path');
     exec = require('../exec');
+    checkKubernetesVersion =
+      require('../check-kubernetes-version').checkKubernetesVersion;
     install = require('../install');
-  });
-  test('install, should perform necessary steps', async () => {
-    // Given
-    const inputs = {minikubeVersion: 'v1.33.7'};
     exec.logExecSync.mockImplementation();
-    exec.execSync.mockImplementation(() => '');
-    // When
-    await install('minikubeFileLocation', inputs);
-    // Then
-    expect(exec.logExecSync).toHaveBeenCalledTimes(5);
-    expect(exec.execSync).toHaveBeenCalledTimes(1);
+    exec.execSync.mockReturnValue('minikube version: v1.33.7');
+  });
+
+  const findStartCommand = () =>
+    exec.logExecSync.mock.calls.find(([cmd]) =>
+      cmd.includes('minikube start')
+    )?.[0];
+
+  describe('binary installation', () => {
+    beforeEach(async () => {
+      await install('/tmp/runner/minikube-binary', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7'
+      });
+    });
+
+    test('makes the binary executable', () => {
+      expect(exec.logExecSync).toHaveBeenCalledWith(
+        'chmod +x /tmp/runner/minikube-binary'
+      );
+    });
+
+    test('creates .minikube directory for compatibility', () => {
+      expect(io.mkdirP).toHaveBeenCalledWith('/tmp/runner/.minikube');
+    });
+
+    test('renames binary to minikube', () => {
+      expect(io.mv).toHaveBeenCalledWith(
+        '/tmp/runner/minikube-binary',
+        '/tmp/runner/minikube'
+      );
+    });
+
+    test('sets MINIKUBE_HOME to binary directory', () => {
+      expect(core.exportVariable).toHaveBeenCalledWith(
+        'MINIKUBE_HOME',
+        '/tmp/runner'
+      );
+    });
+
+    test('adds binary directory to PATH', () => {
+      expect(core.addPath).toHaveBeenCalledWith('/tmp/runner');
+    });
+  });
+
+  describe('start command', () => {
+    test('includes kubernetes version', async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7'
+      });
+      expect(findStartCommand()).toContain('--kubernetes-version v1.33.7');
+    });
+
+    test('includes vm-driver', async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7',
+        driver: 'docker'
+      });
+      expect(findStartCommand()).toContain('--vm-driver=docker');
+    });
+
+    test('includes container runtime when specified', async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7',
+        containerRuntime: 'containerd'
+      });
+      expect(findStartCommand()).toContain('--container-runtime=containerd');
+    });
+
+    test('includes start args', async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7',
+        startArgs: '--extra-config=kubelet.max-pods=50'
+      });
+      expect(findStartCommand()).toContain(
+        '--extra-config=kubelet.max-pods=50'
+      );
+    });
+
+    test('uses sudo for none driver', async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7',
+        driver: 'none'
+      });
+      expect(findStartCommand()).toMatch(/^sudo -E /);
+    });
+
+    test('does not use sudo for docker driver', async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7',
+        driver: 'docker'
+      });
+      expect(findStartCommand()).not.toContain('sudo');
+    });
+  });
+
+  describe('with supported kubernetes version', () => {
+    beforeEach(async () => {
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7',
+        startArgs: ''
+      });
+    });
+
+    test('does not add --force flag', () => {
+      expect(findStartCommand()).not.toContain('--force');
+    });
+
+    test('does not set force output', () => {
+      expect(core.setOutput).not.toHaveBeenCalledWith('force', 'true');
+    });
+  });
+
+  describe('with unsupported kubernetes version', () => {
+    beforeEach(async () => {
+      checkKubernetesVersion.mockResolvedValue('unsupported');
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.99.0',
+        startArgs: ''
+      });
+    });
+
+    test('adds --force flag to start command', () => {
+      expect(findStartCommand()).toContain('--force');
+    });
+
+    test('warns about the force flag', () => {
+      expect(core.warning).toHaveBeenCalledWith(
+        expect.stringContaining('--force')
+      );
+    });
+
+    test('sets force output', () => {
+      expect(core.setOutput).toHaveBeenCalledWith('force', 'true');
+    });
+  });
+
+  describe('version check ordering', () => {
+    test('checks kubernetes version before starting minikube', async () => {
+      const callOrder = [];
+      checkKubernetesVersion.mockImplementation(async () => {
+        callOrder.push('checkKubernetesVersion');
+        return 'supported';
+      });
+      exec.logExecSync.mockImplementation(cmd => {
+        if (cmd.includes('minikube start')) callOrder.push('start');
+      });
+      await install('/tmp/runner/minikube', {
+        minikubeVersion: 'v1.33.7',
+        kubernetesVersion: 'v1.33.7'
+      });
+      expect(callOrder.indexOf('checkKubernetesVersion')).toBeLessThan(
+        callOrder.indexOf('start')
+      );
+    });
   });
 });

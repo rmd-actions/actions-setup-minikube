@@ -1,6 +1,6 @@
 'use strict';
 
-const fs = require('fs');
+const fs = require('node:fs');
 
 const isLinux = () => process.platform.toLowerCase().indexOf('linux') === 0;
 const isUbuntu = version => () => {
@@ -12,11 +12,13 @@ const isUbuntu = version => () => {
     osInfo.indexOf(`VERSION="${version}`) >= 0
   );
 };
-['18', '20', '22', '24'].some(v => isUbuntu(v)())
-const isValidLinux = () => isLinux() && ['18', '20', '22', '24'].some(v => isUbuntu(v)());
+const isValidLinux = () =>
+  isLinux() && ['18', '20', '22', '24'].some(v => isUbuntu(v)());
 const checkOperatingSystem = () => {
   if (!isValidLinux()) {
-    throw Error('Unsupported OS, action only works in Ubuntu 18, 20, 22, or 24');
+    throw Error(
+      'Unsupported OS, action only works in Ubuntu 18, 20, 22, or 24'
+    );
   }
 };
 

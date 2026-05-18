@@ -47,15 +47,17 @@ This is a GitHub Action and cannot be run directly. Test locally by:
 src/
   index.js              # Entry point - orchestrates the setup process
   check-environment.js  # Validates Ubuntu version (18, 20, 22, 24)
-  load-inputs.js        # Loads action inputs via @actions/core
+  check-kubernetes-version.js # Validates K8s version against Minikube's supported list
   configure-environment.js # Prepares system (apt packages, Docker, CNI plugins)
   download.js           # Downloads binaries from GitHub releases (Minikube, CNI plugins, crictl, cri-dockerd)
-  install.js            # Installs and starts Minikube
-  exec.js               # Shell command execution utilities
   error-handler.js      # Global error handling
+  exec.js               # Shell command execution utilities
+  github.js             # GitHub API request utility (authenticated/unauthenticated)
+  install.js            # Installs and starts Minikube
+  load-inputs.js        # Loads action inputs via @actions/core
   __tests__/            # Jest unit tests (mirror src/ structure)
 
-action.yml              # GitHub Action definition
+action.yml              # GitHub Action definition (outputs: `force`)
 .github/workflows/
   check.yml             # CI: format check + unit tests
   runner.yml            # E2E tests: runs action against multiple K8s versions
@@ -63,23 +65,34 @@ action.yml              # GitHub Action definition
 
 ### Design Patterns
 
-- **Modular pipeline**: `index.js` orchestrates discrete steps (check, load, configure, download, install)
+- **Modular pipeline**: `index.js` orchestrates: `checkEnvironment()` → `loadInputs()` → `configureEnvironment(inputs)` → `download.downloadMinikube(inputs)` → `install(downloadedFile, inputs)`. Note: binary downloads for CNI plugins, crictl, and cri-dockerd happen inside `configureEnvironment()`, not as a separate pipeline step.
 - **GitHub Actions toolkit**: Uses `@actions/core` for inputs/outputs, `@actions/tool-cache` for downloads
-- **GitHub API integration**: Uses Axios to fetch release information from GitHub API (supports authenticated requests via `github token` input)
+- **GitHub API integration**: `src/github.js` provides a `gitHubRequest` utility wrapping Axios for authenticated/unauthenticated GitHub API calls. Used by `download.js` and `check-kubernetes-version.js`.
 - **Driver-specific logic**: Different setup paths for `none` vs `docker` drivers (none requires CNI plugins, crictl, cri-dockerd)
+- **Kubernetes version validation**: `check-kubernetes-version.js` checks if the requested K8s version is in Minikube's built-in supported list. If not, it verifies the version exists as a GitHub release and returns `UNSUPPORTED` (triggering `--force` flag). If the version doesn't exist at all, it throws an error.
 
 ### Key Dependencies
 
+**npm packages (in `package.json`):**
 - `@actions/core` - Action inputs, outputs, and logging
-- `@actions/tool-cache` - Binary downloads and caching
+- `@actions/github` - GitHub context utilities
 - `@actions/io` - File system operations
-- `axios` - HTTP requests to GitHub API
+- `@actions/tool-cache` - Binary downloads and caching
+- `axios` - HTTP requests to GitHub API (via `src/github.js`)
+
+**Binary dependencies (pinned versions in `src/download.js`):**
+- **CNI plugins** (`containernetworking/plugins`) - Required by cri-dockerd and recent Minikube releases for container networking
+- **cri-tools / crictl** (`kubernetes-sigs/cri-tools`) - CRI CLI tool for interacting with container runtimes
+- **cri-dockerd** (`Mirantis/cri-dockerd`) - CRI shim for Docker Engine
+
+These binaries are downloaded at runtime from GitHub releases. Their versions are hardcoded as `const tag = '...'` values in `src/download.js` (not in `package.json`).
 
 ## Code Style
 
 ### Formatting
 
 Prettier is configured via `.prettierrc.json`:
+- Semicolons enabled
 - Single quotes
 - No trailing commas
 - No bracket spacing (`{foo}` not `{ foo }`)
@@ -188,19 +201,61 @@ describe('UserService', () => {
 
 ### Updating Dependencies
 
-1. Update version in `package.json` or `src/*.js`
-2. Run `npm install`
-3. Test with `npm test` and `npm run format-check`
-4. **Before committing**: Run `npm prune --omit=dev` to remove devDependencies
-5. Commit changes including `node_modules/` (required for GitHub Actions - only production deps)
+**CRITICAL**: This is a GitHub Action. `node_modules/` is committed to the repository with production dependencies only. Every dependency update commit must include the updated `node_modules/` contents for production dependencies.
 
-**Important**: GitHub Actions run directly from the repository, so `node_modules/` must be committed. However, only production dependencies should be included. Always prune devDependencies before committing.
+**For each dependency update, follow this exact sequence:**
+
+1. Start from a clean git state (no uncommitted changes)
+2. Install the updated package: `npm install <package>@<version> --save-exact --ignore-scripts`
+3. Install all dependencies (needed for testing): `npm install --ignore-scripts`
+4. Run tests: `npm test`
+5. Run format check: `npm run format-check` (if updating prettier, run `npm run format` first and include reformatted source files in the commit)
+6. **Prune devDependencies**: `npm prune --omit=dev --ignore-scripts`
+7. Stage and commit: `git add package.json package-lock.json node_modules/` (and any reformatted source files)
+8. Create one commit per dependency update
+
+**Common mistakes to avoid:**
+- **Forgetting to commit `node_modules/`**: The action runs directly from the repo, so `node_modules/` must always be committed with production deps
+- **Committing devDependencies in `node_modules/`**: Always run `npm prune --omit=dev` before staging `node_modules/`
+- **Mixing multiple dependency updates in one commit**: Update and commit each dependency separately
+- **Running `npm test` after pruning**: Jest is a devDependency, so tests must run before `npm prune --omit=dev`
+- **Not running format check after updating prettier**: New prettier versions may reformat existing code — run `npm run format` and include those changes in the commit
+
+**DevDependency updates** (jest, prettier, husky) only change `package.json` and `package-lock.json` since they are pruned from `node_modules/` before committing.
+
+**Production dependency updates** (axios, @actions/core, @actions/tool-cache, etc.) change `package.json`, `package-lock.json`, AND files within `node_modules/`.
+
+#### Binary dependency updates (CNI plugins, cri-tools, cri-dockerd)
+
+These are **not** npm packages. Their versions are hardcoded in `src/download.js` as `const tag = '...'` values, and they also have matching version strings in `src/__tests__/download.test.js`.
+
+**To update a binary dependency:**
+
+1. Check the latest release on the corresponding GitHub repo
+2. Update the `const tag` value in `src/download.js`
+3. Update the matching URL in `src/__tests__/download.test.js`
+4. Run tests: `npm test`
+5. **Create a separate pull request** (not just a commit) for each binary dependency update — these changes require E2E validation via the `runner.yml` workflow to verify Minikube still starts correctly with the new versions
 
 ### Releasing a New Version
 
-1. Update version in `package.json`
-2. Create release commit and tag
-3. Husky post-commit hook handles `node_modules` pruning
+Releases use lightweight tags and a commit message format of `[RELEASE] Release v<version>`. The release commit must update exactly 4 files: `package.json`, `package-lock.json`, `node_modules/.package-lock.json`, and `README.md`.
+
+**Follow this exact sequence:**
+
+1. Bump the version in `package.json`
+2. Update the action reference in `README.md` (e.g., `manusa/actions-setup-minikube@v2.16.0` → `@v2.16.1`)
+3. Regenerate `package-lock.json`: `npm install --ignore-scripts --package-lock-only`
+4. **Prune devDependencies** so `node_modules/.package-lock.json` only contains the version bump (not dev deps): `npm prune --omit=dev --ignore-scripts`
+5. Stage all 4 files: `git add package.json package-lock.json node_modules/.package-lock.json README.md`
+6. Commit with sign-off: `git commit --signoff -m "[RELEASE] Release v<version>"`
+7. Create a lightweight tag: `git tag v<version>`
+8. Push: `git push origin master --tags`
+
+**Common mistakes to avoid:**
+- **Forgetting to prune dev deps before staging**: `node_modules/.package-lock.json` will have a huge diff with all dev dependencies instead of just the version bump
+- **Forgetting `package-lock.json` and `node_modules/.package-lock.json`**: Both lock files must be in the release commit — check against previous releases (e.g., `git show e5e04be --stat`)
+- **Running `npm install` instead of `--package-lock-only`**: This reinstalls dev deps into `node_modules/`, requiring another prune
 
 ## Troubleshooting
 
@@ -222,3 +277,33 @@ E2E tests in `runner.yml` require GitHub Actions environment. Check:
 ### Action Fails with "Unsupported OS"
 
 The action only supports Ubuntu Linux. Check `src/check-environment.js` for supported versions.
+
+## Feature Specifications
+
+Feature specs in `docs/specs/` are **living documentation** that describe architectural decisions and planned features. Unlike ADRs (which are point-in-time decisions), specs are updated whenever the feature or architecture changes.
+
+### Purpose
+
+Specs serve as the authoritative reference for:
+- **Architecture**: Execution model, module system, dependency management
+- **Requirements**: What the feature must do (testable statements)
+- **Configuration**: Dependencies, versions, constraints
+
+### When to Read Specs
+
+**Before modifying a feature**: Read its spec to understand current behavior, requirements, and constraints. The spec tells you what invariants must be preserved.
+
+**Before implementing related features**: Specs document integration points and dependencies.
+
+### When to Update Specs
+
+**After changing a feature**: If you modify behavior, architecture, or configuration, update the spec to match. The spec must always reflect the current implementation.
+
+**After adding requirements**: New requirements discovered during implementation should be documented.
+
+### Available Specs
+
+| Feature | Spec | Status | Covers |
+|---------|------|--------|--------|
+| Architecture | `docs/specs/architecture.md` | In progress (CJS→ESM migration) | Execution model, module system, committed node_modules, pipeline design |
+| Testing | `docs/specs/testing.md` | In progress (behavioral refactoring) | Behavioral testing strategy, HTTP test server, mock boundaries, test organization |
