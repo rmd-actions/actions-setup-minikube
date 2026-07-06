@@ -6,7 +6,7 @@ This file provides guidance to AI coding agents (GitHub Copilot, Claude Code, et
 
 ## Project Overview
 
-A GitHub Action that sets up a single-node Kubernetes cluster using Minikube in CI workflows. It downloads and installs Minikube with specified versions of Kubernetes, supporting multiple drivers (`none`, `docker`) and container runtimes (`docker`, `cri-o`, `containerd`). Built with Node.js 20 using GitHub Actions toolkit libraries.
+A GitHub Action that sets up a single-node Kubernetes cluster using Minikube in CI workflows. It downloads and installs Minikube with specified versions of Kubernetes, supporting multiple drivers (`none`, `docker`) and container runtimes (`docker`, `cri-o`, `containerd`). Built with Node.js 24 using GitHub Actions toolkit libraries.
 
 ## Working Effectively
 
@@ -86,6 +86,24 @@ action.yml              # GitHub Action definition (outputs: `force`)
 - **cri-dockerd** (`Mirantis/cri-dockerd`) - CRI shim for Docker Engine
 
 These binaries are downloaded at runtime from GitHub releases. Their versions are hardcoded as `const tag = '...'` values in `src/download.js` (not in `package.json`).
+
+### SHA256 Verification
+
+Every binary downloaded by `src/download.js` is SHA256-verified before use. Two helpers funnel all downloads — **no bare `tc.downloadTool` call should appear in this module**:
+
+- **`downloadGitHubArtifact(...)`** — for release-asset downloads. Requires exactly one of:
+  - **`verifyWithCompanionSha256: true`** — looks up the `<asset.name>.sha256` companion asset in the same release, fetches its body via `gitHubRequest` (with `responseType: 'text'`), parses the leading hex token, validates the format with `assertSha256Hex`, and aborts on mismatch. Used for **minikube**, **CNI plugins**, and **crictl** — all three upstreams publish `.sha256` companions.
+  - **`expectedSha256: '<hex>'`** — verifies against a pinned hex value. Used for **cri-dockerd**, whose releases do not publish any checksum companion files. Pinned values live in `src/checksums.js`.
+
+  Passing both options throws "both provided"; passing neither throws "neither provided" — the funnel is fail-loud on misuse.
+
+- **`downloadVerifiedUrl({url, expectedSha256, label})`** — for direct-URL downloads that aren't release assets (e.g. the cri-dockerd source archive at `github.com/<repo>/archive/refs/tags/<v>.tar.gz`). Pairs `tc.downloadTool` with `verifySha256File` so download and verification cannot drift apart.
+
+When `installCriDockerd` runs on an arch with no pinned digest in `checksums.criDockerd.binarySha256`, it throws an arch-specific error before reaching the funnel ("No pinned SHA256 for arch=…") — adding a new arch to `src/arch.js` without updating `src/checksums.js` fails fast with a self-diagnosing message.
+
+`verifySha256File` and the parser both call `assertSha256Hex` to reject non-hex / wrong-length inputs early, so a malformed companion response or a typo in `checksums.js` surfaces as "Invalid SHA256 digest" rather than a generic mismatch.
+
+When a verification fails, the action throws and aborts before any extraction or installation. There is no fallback path.
 
 ## Code Style
 
@@ -192,6 +210,16 @@ describe('UserService', () => {
 2. Test locally with `npm test`
 3. Push and verify CI workflows pass
 
+### Adding Support for a New Architecture
+
+Architecture detection lives in `src/arch.js`, which maps `process.arch` to the GitHub release naming convention used by the binaries this action downloads (e.g. `x64` → `amd64`, `arm64` → `arm64`). To add a new architecture:
+
+1. Extend the `switch` in `src/arch.js` with the new `process.arch` value and its GitHub release suffix. Keep the default branch throwing — the strict allow-list is intentional so unsupported runners fail fast.
+2. Add coverage in `src/__tests__/arch.test.js` (the success case) and `src/__tests__/check-environment.test.js` (the fail-fast behavior on unsupported archs).
+3. Add fixtures and an `on <arch> host` describe in `src/__tests__/download.test.js` for each of the four downloads (Minikube, CNI plugins, crictl, cri-dockerd) so the asset predicates are verified end-to-end.
+4. Extend the `os` matrix axis in `.github/workflows/runner.yml` for the jobs that exercise the relevant code path (at minimum `default-inputs` for the `none` driver and `docker-driver` for the docker path).
+5. Confirm the four upstreams publish assets for the new architecture before relying on it — release naming is upstream-defined and not all tags carry every arch.
+
 ### Adding a New Action Input
 
 1. Add input definition in `action.yml`
@@ -227,15 +255,36 @@ describe('UserService', () => {
 
 #### Binary dependency updates (CNI plugins, cri-tools, cri-dockerd)
 
-These are **not** npm packages. Their versions are hardcoded in `src/download.js` as `const tag = '...'` values, and they also have matching version strings in `src/__tests__/download.test.js`.
+These are **not** npm packages. Their versions are hardcoded in `src/download.js` as `const tag = '...'` values (or in `src/checksums.js` for cri-dockerd), and they also have matching version strings in `src/__tests__/download.test.js`.
 
 **To update a binary dependency:**
 
 1. Check the latest release on the corresponding GitHub repo
-2. Update the `const tag` value in `src/download.js`
+2. Update the `const tag` value in `src/download.js` (or `criDockerd.tag` in `src/checksums.js` for cri-dockerd)
 3. Update the matching URL in `src/__tests__/download.test.js`
-4. Run tests: `npm test`
-5. **Create a separate pull request** (not just a commit) for each binary dependency update — these changes require E2E validation via the `runner.yml` workflow to verify Minikube still starts correctly with the new versions
+4. **For cri-dockerd only**: also recompute and update the pinned SHA256 digests — see "Rotating the cri-dockerd pinned digests" below
+5. Run tests: `npm test`
+6. **Create a separate pull request** (not just a commit) for each binary dependency update — these changes require E2E validation via the `runner.yml` workflow to verify Minikube still starts correctly with the new versions
+
+#### Rotating the cri-dockerd pinned digests
+
+cri-dockerd publishes no `.sha256` companion assets, so its checksums are pinned in `src/checksums.js`. The minikube, CNI plugins, and crictl downloads consume their upstream `.sha256` companions automatically — no pinned values to maintain for those.
+
+When bumping `criDockerd.tag`, recompute all three digests:
+
+```shell
+TAG=v0.3.25  # the new tag
+curl -sLo /tmp/cri-dockerd-amd64.tgz "https://github.com/Mirantis/cri-dockerd/releases/download/${TAG}/cri-dockerd-${TAG#v}.amd64.tgz"
+curl -sLo /tmp/cri-dockerd-arm64.tgz "https://github.com/Mirantis/cri-dockerd/releases/download/${TAG}/cri-dockerd-${TAG#v}.arm64.tgz"
+curl -sLo /tmp/cri-dockerd-source.tar.gz "https://github.com/Mirantis/cri-dockerd/archive/refs/tags/${TAG}.tar.gz"
+sha256sum /tmp/cri-dockerd-amd64.tgz /tmp/cri-dockerd-arm64.tgz /tmp/cri-dockerd-source.tar.gz
+```
+
+Paste the three hex values into `criDockerd.binarySha256.amd64`, `criDockerd.binarySha256.arm64`, and `criDockerd.sourceSha256` respectively. Mismatches at runtime cause the action to abort before installing anything, so getting these wrong is loud (action fails) rather than silent.
+
+**Common mistakes to avoid:**
+- **Forgetting to update the source archive digest**: `sourceSha256` is for the GitHub auto-generated archive (`archive/refs/tags/<tag>.tar.gz`), not a release asset — easy to miss because it isn't listed under "Assets" on the release page.
+- **Bumping `tag` without updating digests**: the action will fail at the first download with `SHA256 mismatch for cri-dockerd-<v>.<arch>.tgz`.
 
 ### Releasing a New Version
 
@@ -251,11 +300,13 @@ Releases use lightweight tags and a commit message format of `[RELEASE] Release 
 6. Commit with sign-off: `git commit --signoff -m "[RELEASE] Release v<version>"`
 7. Create a lightweight tag: `git tag v<version>`
 8. Push: `git push origin master --tags`
+9. **Publish the GitHub Release manually via the GitHub UI** (https://github.com/manusa/actions-setup-minikube/releases/new). Select the `v<version>` tag, set the title to `v<version>`, and click "Generate release notes" to auto-populate the body (matches the historical style: a `**Full Changelog**: …compare/v<prev>...v<version>` link plus the PR list). This step is required — pushing the tag alone does not publish a GitHub Release, and downstream consumers and Marketplace listings look at Releases, not raw tags. AI agents should not run `gh release create` for this; leave it to the maintainer.
 
 **Common mistakes to avoid:**
 - **Forgetting to prune dev deps before staging**: `node_modules/.package-lock.json` will have a huge diff with all dev dependencies instead of just the version bump
 - **Forgetting `package-lock.json` and `node_modules/.package-lock.json`**: Both lock files must be in the release commit — check against previous releases (e.g., `git show e5e04be --stat`)
 - **Running `npm install` instead of `--package-lock-only`**: This reinstalls dev deps into `node_modules/`, requiring another prune
+- **Stopping after `git push`**: the tag exists on the remote but no GitHub Release is published until step 9 — Marketplace and the Releases page will still show the previous version as latest.
 
 ## Troubleshooting
 

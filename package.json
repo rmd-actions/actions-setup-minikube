@@ -1,6 +1,6 @@
 {
   "name": "github-actions-setup-minikube",
-  "version": "2.16.1",
+  "version": "2.18.0",
   "description": "Set up your GitHub Actions workflow with a specific version of Minikube and Kubernetes",
   "main": "src/index.js",
   "scripts": {
@@ -29,10 +29,10 @@
   "homepage": "https://github.com/manusa/actions-setup-minikube#readme",
   "dependencies": {
     "@actions/core": "2.0.3",
-    "@actions/github": "6.0.0",
+    "@actions/github": "8.0.1",
     "@actions/io": "2.0.0",
     "@actions/tool-cache": "3.0.1",
-    "axios": "1.13.6"
+    "axios": "1.16.1"
   },
   "devDependencies": {
     "husky": "9.1.7",
