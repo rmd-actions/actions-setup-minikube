@@ -62,7 +62,7 @@ Each step is a separate module with a single responsibility:
 
 | Module | Responsibility |
 |--------|----------------|
-| `src/check-environment.js` | Validates Ubuntu version (18, 20, 22, 24) |
+| `src/check-environment.js` | Validates Ubuntu 18.04 or later |
 | `src/load-inputs.js` | Loads action inputs via `@actions/core` |
 | `src/configure-environment.js` | Prepares system (apt packages, Docker, CNI plugins) |
 | `src/download.js` | Downloads binaries from GitHub releases |
@@ -73,6 +73,7 @@ Each step is a separate module with a single responsibility:
 | Module | Responsibility |
 |--------|----------------|
 | `src/exec.js` | Shell command execution utilities (`execSync`, `logExecSync`) |
+| `src/shell-quote.js` | `shellQuote` for embedding action-controlled values (paths) in shell commands |
 | `src/error-handler.js` | Global error handling, sets action as failed |
 | `src/github.js` | GitHub API requests via Axios (authenticated and unauthenticated) |
 | `src/check-kubernetes-version.js` | Validates Kubernetes version against Minikube's supported list |
@@ -151,7 +152,7 @@ The project is currently CommonJS (`require`/`module.exports`). All four `@actio
 | Package | Current (CJS) | Target (ESM-only) |
 |---------|---------------|---------------------|
 | `@actions/core` | 2.0.3 | 3.0.0 |
-| `@actions/github` | 6.0.0 | Remove (unused) |
+| `@actions/github` | Removed (unused) | Not needed |
 | `@actions/io` | 2.0.0 | 3.0.2 |
 | `@actions/tool-cache` | 3.0.1 | 4.0.0 |
 | `axios` | 1.13.6 | 1.13.6 (has CJS fallback, no concern) |
