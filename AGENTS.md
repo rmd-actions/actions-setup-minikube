@@ -46,12 +46,13 @@ This is a GitHub Action and cannot be run directly. Test locally by:
 ```
 src/
   index.js              # Entry point - orchestrates the setup process
-  check-environment.js  # Validates Ubuntu version (18, 20, 22, 24)
+  check-environment.js  # Validates Ubuntu 18.04 or later (ID/VERSION_ID in /etc/os-release)
   check-kubernetes-version.js # Validates K8s version against Minikube's supported list
   configure-environment.js # Prepares system (apt packages, Docker, CNI plugins)
   download.js           # Downloads binaries from GitHub releases (Minikube, CNI plugins, crictl, cri-dockerd)
   error-handler.js      # Global error handling
   exec.js               # Shell command execution utilities
+  shell-quote.js        # shellQuote: quotes action-controlled values (paths) for shell commands
   github.js             # GitHub API request utility (authenticated/unauthenticated)
   install.js            # Installs and starts Minikube
   load-inputs.js        # Loads action inputs via @actions/core
@@ -60,22 +61,23 @@ src/
 action.yml              # GitHub Action definition (outputs: `force`)
 .github/workflows/
   check.yml             # CI: format check + unit tests
-  runner.yml            # E2E tests: runs action against multiple K8s versions
+  runner.yml            # E2E tests: runs action against multiple K8s versions and Ubuntu runner images
 ```
 
 ### Design Patterns
 
 - **Modular pipeline**: `index.js` orchestrates: `checkEnvironment()` → `loadInputs()` → `configureEnvironment(inputs)` → `download.downloadMinikube(inputs)` → `install(downloadedFile, inputs)`. Note: binary downloads for CNI plugins, crictl, and cri-dockerd happen inside `configureEnvironment()`, not as a separate pipeline step.
+- **Shell commands**: Commands run through `/bin/sh` (`src/exec.js`). Wrap action-controlled values (temp/tool-cache paths) and validated inputs (`kubernetes version`) in `shellQuote` from `src/shell-quote.js`. The `start args`, `driver` and `container runtime` inputs are appended as-is on purpose: existing workflows may rely on the shell evaluating them (word splitting, quotes, `$VAR` expansion). Never quote, parse or validate them unless every value users pass today provably keeps working; otherwise it breaks user pipelines.
 - **GitHub Actions toolkit**: Uses `@actions/core` for inputs/outputs, `@actions/tool-cache` for downloads
 - **GitHub API integration**: `src/github.js` provides a `gitHubRequest` utility wrapping Axios for authenticated/unauthenticated GitHub API calls. Used by `download.js` and `check-kubernetes-version.js`.
-- **Driver-specific logic**: Different setup paths for `none` vs `docker` drivers (none requires CNI plugins, crictl, cri-dockerd)
+- **Driver-specific logic**: Different setup paths for `none` vs `docker` drivers (none requires CNI plugins, crictl, cri-dockerd). The `none` driver runs `minikube start` as root with the runner's environment (`HOME` and `MINIKUBE_HOME` must survive, or minikube writes its config under `/root`). sudo-rs, Ubuntu's default sudo since 25.10, ignores `sudo -E`, so `src/install.js` uses classic sudo (`/usr/bin/sudo.ws -E`) when it is installed and a non-interactive probe (`sudo.ws -n -E true`) succeeds, and otherwise falls back to `sudo -E --preserve-env=HOME,MINIKUBE_HOME`. That fallback forwards the whole environment on classic sudo but only those two variables on sudo-rs, so on sudo-rs-only hosts `KUBECONFIG`, proxy and `MINIKUBE_*` variables do not reach minikube. Never add secrets to that `--preserve-env` list, or replace `-E` with a full list of variable names: classic sudo writes the values of explicitly preserved variables to syslog, and an explicit list bypasses sudo's filtering of unsafe variables such as `BASH_ENV`.
+- **Default container runtime**: Minikube v1.39.0 changed its default container runtime to containerd, but the action has always used docker (it sets up cri-dockerd for the `none` driver). When the `container runtime` input is empty and `MINIKUBE_CONTAINER_RUNTIME` is unset or empty, `src/install.js` passes `--container-runtime=docker`, before the start args. Many workflows set `--container-runtime` in `start args`, and minikube keeps the last value of a repeated flag, so theirs still wins. The `container-runtime-start-args` and `container-runtime-env` E2E jobs guard both cases. On sudo-rs-only hosts with the `none` driver, `MINIKUBE_CONTAINER_RUNTIME` still makes the action step aside but never reaches minikube (see the sudo notes above), so minikube falls back to its own default; this is documented in the README rather than fixed by growing the `--preserve-env` list.
 - **Kubernetes version validation**: `check-kubernetes-version.js` checks if the requested K8s version is in Minikube's built-in supported list. If not, it verifies the version exists as a GitHub release and returns `UNSUPPORTED` (triggering `--force` flag). If the version doesn't exist at all, it throws an error.
 
 ### Key Dependencies
 
 **npm packages (in `package.json`):**
 - `@actions/core` - Action inputs, outputs, and logging
-- `@actions/github` - GitHub context utilities
 - `@actions/io` - File system operations
 - `@actions/tool-cache` - Binary downloads and caching
 - `axios` - HTTP requests to GitHub API (via `src/github.js`)
@@ -206,9 +208,20 @@ describe('UserService', () => {
 
 ### Adding Support for a New Kubernetes Version
 
-1. Update E2E test matrix in `.github/workflows/runner.yml`
-2. Test locally with `npm test`
-3. Push and verify CI workflows pass
+This is periodic maintenance of the E2E matrix. New Kubernetes versions need no source change: `check-kubernetes-version.js` classifies a version missing from Minikube's built-in list as `UNSUPPORTED`, and `install.js` then adds `--force`. A Minikube bump may still need one (see step 1).
+
+1. Find the latest patch of each Kubernetes minor and the latest Minikube release (`gh release list --repo kubernetes/minikube`). The default `gh release list` page (30 releases) misses the older minors, so use:
+   ```shell
+   gh release list --repo kubernetes/kubernetes --exclude-pre-releases --limit 400 --json tagName --jq '[.[].tagName | select(test("^v1\\.[0-9]+\\.[0-9]+$"))] | group_by(split(".")[1] | tonumber) | map(max_by(split(".")[2] | tonumber)) | reverse | .[]'
+   ```
+   Read the Minikube release notes for changed defaults the action relies on (driver, container runtime). Don't work around those in `runner.yml`: the jobs that use the action's defaults show what users get, so preserve the existing behavior in the action instead.
+2. Update `.github/workflows/runner.yml`:
+   - `minikube version` in every job except `unsupported-with-force`. Leave both of that job's versions alone: it pins an older Minikube on purpose, and its `Verify K8s version is not in Minikube supported list` step checks that the Kubernetes version is still outside that Minikube's list.
+   - `default-inputs` and `container-runtime`: the five newest minors at their latest upstream patch, even when that patch is newer than Minikube's list. `container-runtime` also keeps `v1.26.15` as its oldest-version canary.
+   - `unsupported`: the minors that left `default-inputs`, down to the oldest minor Minikube supports (the last entry of `minikube config defaults kubernetes-version`), plus `v1.26.15`, which is older than that and keeps the too-old `--force` path covered on the `none` driver.
+   - `os-smoke`, `docker-driver`, `ingress`, `container-runtime-start-args` and `container-runtime-env`: the newest minor. `extra-args`: the second-newest minor.
+3. Update the `minikube version` and `kubernetes version` in the `README.md` usage examples (Basic and `start args`). The release commit only moves the action tag in those examples, so merge them together with, or after, any action change the new Minikube needs, and release soon after, so the example on `master` never names a Minikube the latest release can't start.
+4. Run `npm test`, then open a pull request: `runner.yml` runs only on pull requests and pushes to `master`. If a version fails E2E, find the cause before swapping it out; earlier rounds replaced a failing `v1.20.15` canary with `v1.26.15` and reverted an `unsupported-with-force` bump.
 
 ### Adding Support for a New Architecture
 
@@ -217,8 +230,12 @@ Architecture detection lives in `src/arch.js`, which maps `process.arch` to the 
 1. Extend the `switch` in `src/arch.js` with the new `process.arch` value and its GitHub release suffix. Keep the default branch throwing — the strict allow-list is intentional so unsupported runners fail fast.
 2. Add coverage in `src/__tests__/arch.test.js` (the success case) and `src/__tests__/check-environment.test.js` (the fail-fast behavior on unsupported archs).
 3. Add fixtures and an `on <arch> host` describe in `src/__tests__/download.test.js` for each of the four downloads (Minikube, CNI plugins, crictl, cri-dockerd) so the asset predicates are verified end-to-end.
-4. Extend the `os` matrix axis in `.github/workflows/runner.yml` for the jobs that exercise the relevant code path (at minimum `default-inputs` for the `none` driver and `docker-driver` for the docker path).
+4. Extend the `os` matrix axis in `.github/workflows/runner.yml` for the jobs that exercise the relevant code path (at minimum `default-inputs` for the `none` driver and `docker-driver` for the docker path), and add the new arch's runner labels to the `os-smoke` job.
 5. Confirm the four upstreams publish assets for the new architecture before relying on it — release naming is upstream-defined and not all tags carry every arch.
+
+### Supporting a New Ubuntu Runner Image
+
+`src/check-environment.js` accepts any Ubuntu whose `VERSION_ID` major is at least `MIN_UBUNTU_MAJOR_VERSION` (18), so a new Ubuntu release needs no code change. When GitHub publishes a new hosted image (e.g. `ubuntu-28.04`), add it and its `-arm` variant to the `os-smoke` job matrix in `.github/workflows/runner.yml`, and update the list of validated images in `README.md`. Drop images from `os-smoke` once GitHub retires them.
 
 ### Adding a New Action Input
 
@@ -290,22 +307,28 @@ Paste the three hex values into `criDockerd.binarySha256.amd64`, `criDockerd.bin
 
 Releases use lightweight tags and a commit message format of `[RELEASE] Release v<version>`. The release commit must update exactly 4 files: `package.json`, `package-lock.json`, `node_modules/.package-lock.json`, and `README.md`.
 
+**Before you start:**
+- Make sure the latest `master` commit is green in both workflows (`Perform checks` and `Run action (E2E tests)`): the release commit and tag go on top of it.
+- Choose the version with a SemVer audit of every change since the last tag against the public API: the `action.yml` inputs and outputs plus the behavior documented in `README.md`. Ignore commit prefixes (`feat:`, `fix:`) and how a change was framed. A backward-compatible addition to what the action supports (a new input or output, newly supported runner images or tool versions) is MINOR; behavior-preserving fixes, hardening and dependency updates are PATCH.
+- Run the npm steps with the npm version CI uses, not the machine's: some local npm versions (e.g. 11.6.x) write lockfiles that CI's `npm ci` rejects. `check.yml` pins no Node version, so CI uses the runner's default npm (10.9.8 on Node 22 at the time of writing; a `Perform checks` log shows it).
+
 **Follow this exact sequence:**
 
 1. Bump the version in `package.json`
-2. Update the action reference in `README.md` (e.g., `manusa/actions-setup-minikube@v2.16.0` → `@v2.16.1`)
-3. Regenerate `package-lock.json`: `npm install --ignore-scripts --package-lock-only`
-4. **Prune devDependencies** so `node_modules/.package-lock.json` only contains the version bump (not dev deps): `npm prune --omit=dev --ignore-scripts`
+2. Update every action reference in `README.md` (e.g., `manusa/actions-setup-minikube@v2.16.0` → `@v2.16.1`); there are two, in the Basic usage example and the `start args` example
+3. Regenerate `package-lock.json` with CI's npm: `npx -y npm@10.9.8 install --ignore-scripts --package-lock-only`
+4. **Prune devDependencies** so `node_modules/.package-lock.json` only contains the version bump (not dev deps): `npx -y npm@10.9.8 prune --omit=dev --ignore-scripts`. Then check that CI accepts the lockfile: in a scratch copy of the repository (never in the checkout, `npm ci` wipes the committed `node_modules/`), `npx -y npm@10.9.8 ci --ignore-scripts --dry-run` must not report `Missing: … from lock file`
 5. Stage all 4 files: `git add package.json package-lock.json node_modules/.package-lock.json README.md`
 6. Commit with sign-off: `git commit --signoff -m "[RELEASE] Release v<version>"`
-7. Create a lightweight tag: `git tag v<version>`
-8. Push: `git push origin master --tags`
-9. **Publish the GitHub Release manually via the GitHub UI** (https://github.com/manusa/actions-setup-minikube/releases/new). Select the `v<version>` tag, set the title to `v<version>`, and click "Generate release notes" to auto-populate the body (matches the historical style: a `**Full Changelog**: …compare/v<prev>...v<version>` link plus the PR list). This step is required — pushing the tag alone does not publish a GitHub Release, and downstream consumers and Marketplace listings look at Releases, not raw tags. AI agents should not run `gh release create` for this; leave it to the maintainer.
+7. Create a lightweight tag: `git tag --no-sign v<version>` (with `tag.gpgSign` enabled, a plain `git tag` tries to create a signed annotated tag and fails with "no tag message?")
+8. Push the branch and the new tag only: `git push origin master v<version>` (`--tags` would also publish any stray local tag)
+9. **Publish the GitHub Release manually via the GitHub UI** (https://github.com/manusa/actions-setup-minikube/releases/new). Select the `v<version>` tag, set the title to `v<version>`, and click "Generate release notes" to auto-populate the body (matches the historical style: a `**Full Changelog**: …compare/v<prev>...v<version>` link plus the PR list). The notes list PR titles, so check the titles of the PRs merged since the last release first (a user-facing change merged under a `ci:` or `chore:` title is easy to miss), and add a short **Highlights** paragraph at the top for behavior changes users should know about. This step is required — pushing the tag alone does not publish a GitHub Release, and downstream consumers and Marketplace listings look at Releases, not raw tags. AI agents should not run `gh release create` for this; leave it to the maintainer.
 
 **Common mistakes to avoid:**
 - **Forgetting to prune dev deps before staging**: `node_modules/.package-lock.json` will have a huge diff with all dev dependencies instead of just the version bump
 - **Forgetting `package-lock.json` and `node_modules/.package-lock.json`**: Both lock files must be in the release commit — check against previous releases (e.g., `git show e5e04be --stat`)
 - **Running `npm install` instead of `--package-lock-only`**: This reinstalls dev deps into `node_modules/`, requiring another prune
+- **Running the npm steps with the machine's npm**: the lockfile can pass `npm test` locally and still break CI's `npm ci` (missing optional peer entries, as happened in #161)
 - **Stopping after `git push`**: the tag exists on the remote but no GitHub Release is published until step 9 — Marketplace and the Releases page will still show the previous version as latest.
 
 ## Troubleshooting
@@ -323,11 +346,11 @@ Run `npm run format` locally before committing. Husky pre-commit hook should han
 E2E tests in `runner.yml` require GitHub Actions environment. Check:
 - Minikube version compatibility
 - Kubernetes version compatibility
-- Ubuntu version (only 18.04, 20.04, 22.04, 24.04 supported)
+- Ubuntu version (18.04 or later supported; the `os-smoke` job covers each GitHub-hosted image)
 
 ### Action Fails with "Unsupported OS"
 
-The action only supports Ubuntu Linux. Check `src/check-environment.js` for supported versions.
+The action only supports Ubuntu Linux 18.04 or later. Check `src/check-environment.js` for the minimum version (`MIN_UBUNTU_MAJOR_VERSION`). The error ends with `(detected: …)`, showing what the check saw: the platform on non-Linux hosts, `linux, no /etc/os-release` when that file is missing, or the os-release `ID` and `VERSION_ID` otherwise (`unknown` when a field is missing or empty).
 
 ## Feature Specifications
 
